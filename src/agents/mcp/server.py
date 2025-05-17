@@ -3,13 +3,16 @@ from __future__ import annotations
 import abc
 import asyncio
 from contextlib import AbstractAsyncContextManager, AsyncExitStack
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Literal
 
 from anyio.streams.memory import MemoryObjectReceiveStream, MemoryObjectSendStream
 from mcp import ClientSession, StdioServerParameters, Tool as MCPTool, stdio_client
 from mcp.client.sse import sse_client
-from mcp.types import CallToolResult, JSONRPCMessage
+from mcp.client.streamable_http import GetSessionIdCallback, streamablehttp_client
+from mcp.shared.message import SessionMessage
+from mcp.types import CallToolResult
 from typing_extensions import NotRequired, TypedDict
 
 from ..exceptions import UserError
@@ -54,7 +57,7 @@ class MCPServer(abc.ABC):
 class _MCPServerWithClientSession(MCPServer, abc.ABC):
     """Base class for MCP servers that use a `ClientSession` to communicate with the server."""
 
-    def __init__(self, cache_tools_list: bool):
+    def __init__(self, cache_tools_list: bool, client_session_timeout_seconds: float | None):
         """
         Args:
             cache_tools_list: Whether to cache the tools list. If `True`, the tools list will be
@@ -63,11 +66,15 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
             by calling `invalidate_tools_cache()`. You should set this to `True` if you know the
             server will not change its tools list, because it can drastically improve latency
             (by avoiding a round-trip to the server every time).
+
+            client_session_timeout_seconds: the read timeout passed to the MCP ClientSession.
         """
         self.session: ClientSession | None = None
         self.exit_stack: AsyncExitStack = AsyncExitStack()
         self._cleanup_lock: asyncio.Lock = asyncio.Lock()
         self.cache_tools_list = cache_tools_list
+
+        self.client_session_timeout_seconds = client_session_timeout_seconds
 
         # The cache is always dirty at startup, so that we fetch tools at least once
         self._cache_dirty = True
@@ -78,8 +85,9 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         self,
     ) -> AbstractAsyncContextManager[
         tuple[
-            MemoryObjectReceiveStream[JSONRPCMessage | Exception],
-            MemoryObjectSendStream[JSONRPCMessage],
+            MemoryObjectReceiveStream[SessionMessage | Exception],
+            MemoryObjectSendStream[SessionMessage],
+            GetSessionIdCallback | None
         ]
     ]:
         """Create the streams for the server."""
@@ -100,8 +108,20 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         """Connect to the server."""
         try:
             transport = await self.exit_stack.enter_async_context(self.create_streams())
-            read, write = transport
-            session = await self.exit_stack.enter_async_context(ClientSession(read, write))
+            # streamablehttp_client returns (read, write, get_session_id)
+            # sse_client returns (read, write)
+
+            read, write, *_ = transport
+
+            session = await self.exit_stack.enter_async_context(
+                ClientSession(
+                    read,
+                    write,
+                    timedelta(seconds=self.client_session_timeout_seconds)
+                    if self.client_session_timeout_seconds
+                    else None,
+                )
+            )
             await session.initialize()
             self.session = session
         except Exception as e:
@@ -137,9 +157,10 @@ class _MCPServerWithClientSession(MCPServer, abc.ABC):
         async with self._cleanup_lock:
             try:
                 await self.exit_stack.aclose()
-                self.session = None
             except Exception as e:
                 logger.error(f"Error cleaning up server: {e}")
+            finally:
+                self.session = None
 
 
 class MCPServerStdioParams(TypedDict):
@@ -182,6 +203,7 @@ class MCPServerStdio(_MCPServerWithClientSession):
         params: MCPServerStdioParams,
         cache_tools_list: bool = False,
         name: str | None = None,
+        client_session_timeout_seconds: float | None = 5,
     ):
         """Create a new MCP server based on the stdio transport.
 
@@ -198,8 +220,9 @@ class MCPServerStdio(_MCPServerWithClientSession):
                 improve latency (by avoiding a round-trip to the server every time).
             name: A readable name for the server. If not provided, we'll create one from the
                 command.
+            client_session_timeout_seconds: the read timeout passed to the MCP ClientSession.
         """
-        super().__init__(cache_tools_list)
+        super().__init__(cache_tools_list, client_session_timeout_seconds)
 
         self.params = StdioServerParameters(
             command=params["command"],
@@ -216,8 +239,9 @@ class MCPServerStdio(_MCPServerWithClientSession):
         self,
     ) -> AbstractAsyncContextManager[
         tuple[
-            MemoryObjectReceiveStream[JSONRPCMessage | Exception],
-            MemoryObjectSendStream[JSONRPCMessage],
+            MemoryObjectReceiveStream[SessionMessage | Exception],
+            MemoryObjectSendStream[SessionMessage],
+            GetSessionIdCallback | None
         ]
     ]:
         """Create the streams for the server."""
@@ -256,6 +280,7 @@ class MCPServerSse(_MCPServerWithClientSession):
         params: MCPServerSseParams,
         cache_tools_list: bool = False,
         name: str | None = None,
+        client_session_timeout_seconds: float | None = 5,
     ):
         """Create a new MCP server based on the HTTP with SSE transport.
 
@@ -273,8 +298,10 @@ class MCPServerSse(_MCPServerWithClientSession):
 
             name: A readable name for the server. If not provided, we'll create one from the
                 URL.
+
+            client_session_timeout_seconds: the read timeout passed to the MCP ClientSession.
         """
-        super().__init__(cache_tools_list)
+        super().__init__(cache_tools_list, client_session_timeout_seconds)
 
         self.params = params
         self._name = name or f"sse: {self.params['url']}"
@@ -283,8 +310,9 @@ class MCPServerSse(_MCPServerWithClientSession):
         self,
     ) -> AbstractAsyncContextManager[
         tuple[
-            MemoryObjectReceiveStream[JSONRPCMessage | Exception],
-            MemoryObjectSendStream[JSONRPCMessage],
+            MemoryObjectReceiveStream[SessionMessage | Exception],
+            MemoryObjectSendStream[SessionMessage],
+            GetSessionIdCallback | None
         ]
     ]:
         """Create the streams for the server."""
@@ -293,6 +321,87 @@ class MCPServerSse(_MCPServerWithClientSession):
             headers=self.params.get("headers", None),
             timeout=self.params.get("timeout", 5),
             sse_read_timeout=self.params.get("sse_read_timeout", 60 * 5),
+        )
+
+    @property
+    def name(self) -> str:
+        """A readable name for the server."""
+        return self._name
+
+
+class MCPServerStreamableHttpParams(TypedDict):
+    """Mirrors the params in`mcp.client.streamable_http.streamablehttp_client`."""
+
+    url: str
+    """The URL of the server."""
+
+    headers: NotRequired[dict[str, str]]
+    """The headers to send to the server."""
+
+    timeout: NotRequired[timedelta]
+    """The timeout for the HTTP request. Defaults to 5 seconds."""
+
+    sse_read_timeout: NotRequired[timedelta]
+    """The timeout for the SSE connection, in seconds. Defaults to 5 minutes."""
+
+    terminate_on_close: NotRequired[bool]
+    """Terminate on close"""
+
+
+class MCPServerStreamableHttp(_MCPServerWithClientSession):
+    """MCP server implementation that uses the Streamable HTTP transport. See the [spec]
+    (https://modelcontextprotocol.io/specification/2025-03-26/basic/transports#streamable-http)
+    for details.
+    """
+
+    def __init__(
+        self,
+        params: MCPServerStreamableHttpParams,
+        cache_tools_list: bool = False,
+        name: str | None = None,
+        client_session_timeout_seconds: float | None = 5,
+    ):
+        """Create a new MCP server based on the Streamable HTTP transport.
+
+        Args:
+            params: The params that configure the server. This includes the URL of the server,
+                the headers to send to the server, the timeout for the HTTP request, and the
+                timeout for the Streamable HTTP connection and whether we need to
+                terminate on close.
+
+            cache_tools_list: Whether to cache the tools list. If `True`, the tools list will be
+                cached and only fetched from the server once. If `False`, the tools list will be
+                fetched from the server on each call to `list_tools()`. The cache can be
+                invalidated by calling `invalidate_tools_cache()`. You should set this to `True`
+                if you know the server will not change its tools list, because it can drastically
+                improve latency (by avoiding a round-trip to the server every time).
+
+            name: A readable name for the server. If not provided, we'll create one from the
+                URL.
+
+            client_session_timeout_seconds: the read timeout passed to the MCP ClientSession.
+        """
+        super().__init__(cache_tools_list, client_session_timeout_seconds)
+
+        self.params = params
+        self._name = name or f"streamable_http: {self.params['url']}"
+
+    def create_streams(
+        self,
+    ) -> AbstractAsyncContextManager[
+        tuple[
+            MemoryObjectReceiveStream[SessionMessage | Exception],
+            MemoryObjectSendStream[SessionMessage],
+            GetSessionIdCallback | None
+        ]
+    ]:
+        """Create the streams for the server."""
+        return streamablehttp_client(
+            url=self.params["url"],
+            headers=self.params.get("headers", None),
+            timeout=self.params.get("timeout", timedelta(seconds=30)),
+            sse_read_timeout=self.params.get("sse_read_timeout", timedelta(seconds=60 * 5)),
+            terminate_on_close=self.params.get("terminate_on_close", True)
         )
 
     @property

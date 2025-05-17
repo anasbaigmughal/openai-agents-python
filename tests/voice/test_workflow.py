@@ -9,7 +9,7 @@ from openai.types.responses import ResponseCompletedEvent
 from openai.types.responses.response_text_delta_event import ResponseTextDeltaEvent
 
 from agents import Agent, Model, ModelSettings, ModelTracing, Tool
-from agents.agent_output import AgentOutputSchema
+from agents.agent_output import AgentOutputSchemaBase
 from agents.handoffs import Handoff
 from agents.items import (
     ModelResponse,
@@ -48,9 +48,11 @@ class FakeStreamingModel(Model):
         input: str | list[TResponseInputItem],
         model_settings: ModelSettings,
         tools: list[Tool],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
     ) -> ModelResponse:
         raise NotImplementedError("Not implemented")
 
@@ -60,9 +62,11 @@ class FakeStreamingModel(Model):
         input: str | list[TResponseInputItem],
         model_settings: ModelSettings,
         tools: list[Tool],
-        output_schema: AgentOutputSchema | None,
+        output_schema: AgentOutputSchemaBase | None,
         handoffs: list[Handoff],
         tracing: ModelTracing,
+        *,
+        previous_response_id: str | None,
     ) -> AsyncIterator[TResponseStreamEvent]:
         output = self.get_next_output()
         for item in output:
